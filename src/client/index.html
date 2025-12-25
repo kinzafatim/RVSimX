@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RVsimX</title>
+    <link rel="stylesheet" href="./static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
+</head>
+
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <img src="./static/logo.png" alt="RVSimX" style="height: 32px;">
+            </div>
+
+            <!-- Central Pill Nav -->
+            <div class="view-toggle-pill">
+                <button class="nav-pill active" data-view="workbench">Workbench</button>
+                <button class="nav-pill" data-view="datapath">Datapath</button>
+            </div>
+
+            <div class="controls">
+                <button id="assemble-btn" class="btn-assemble">Assemble</button>
+                <button id="run-btn" class="btn-control">Run</button>
+                <button id="step-btn" class="btn-control">Step</button>
+                <button id="prev-btn" class="btn-control">Prev</button>
+                <button id="reset-btn" class="btn-control">Reset</button>
+            </div>
+        </header>
+
+        <main>
+            <!-- Workbench View -->
+            <div id="workbench-view" class="page-content active">
+                <!-- Editor Card -->
+                <div class="card editor-card">
+                    <div class="card-header">
+                        <div class="tabs-left">
+                            <div class="tab-item active" data-target="code-panel">EDITOR</div>
+                            <div class="tab-item" data-target="trace-panel">EXECUTION TRACE</div>
+                        </div>
+
+                        <div class="header-right-group">
+                            <div id="trace-actions" class="hidden" style="display: flex; gap: 6px; margin-right: 10px;">
+                                <button id="copy-hex-btn" class="xs-btn">Copy Hex</button>
+                                <button id="download-mem-btn" class="xs-btn">Download Hex.txt</button>
+                            </div>
+                            <div class="pc-badge">PC: <span id="pc-value">0x0000</span></div>
+                        </div>
+                    </div>
+
+                    <div class="card-body">
+                        <div id="code-panel" class="panel-full active">
+                            <textarea id="asm-editor" style="display:none;"># RISC-V Program
+li x1, 10
+li x2, 20
+add x3, x1, x2</textarea>
+                        </div>
+                        <div id="trace-panel" class="panel-full hidden" style="overflow: auto;">
+                            <table class="trace-table">
+                                <thead>
+                                    <tr>
+                                        <th>MACHINE CODE</th>
+                                        <th>BASIC CODE</th>
+                                        <th>ORIGINAL CODE</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="trace-body"></tbody>
+                            </table>
+                        </div>
+                        <div id="error-list" class="error-container hidden"></div>
+                    </div>
+                </div>
+
+                <!-- Registers/Memory Card -->
+                <div class="card sidebar-card">
+                    <div class="card-header">
+                        <div class="tabs-left">
+                            <div class="tab-item active" data-target="regs-panel">REGISTERS</div>
+                            <div class="tab-item" data-target="mem-panel">MEMORY</div>
+                        </div>
+                        <div class="fmt-toggle-pill">
+                            <button class="fmt-pill active" data-value="hex">HEX</button>
+                            <button class="fmt-pill" data-value="dec">DEC</button>
+                        </div>
+                    </div>
+
+                    <div class="card-body">
+                        <div id="regs-panel" class="panel-full active reg-list-container"></div>
+                        <div id="mem-panel" class="panel-full hidden mem-list-container">
+                            <div id="memory-hex" class="hex-dump"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Datapath View -->
+            <div id="datapath-view" class="page-content hidden">
+                <div class="atomic-viz-container">
+                    <!-- Header -->
+                    <div class="viz-header">
+                        <div class="header-top">
+                            <div>
+                                <h1 class="viz-title">RISC-V 'A' Visualizer (Custom Flow)</h1>
+                                <p class="viz-subtitle">Flow: ID+Fetch &rarr; EX(Atomic ALU) &rarr; MEM(Store) &rarr; WB
+                                </p>
+                            </div>
+                            <div id="inst-buttons" class="inst-btn-group">
+                                <!-- JS will inject buttons here -->
+                            </div>
+                        </div>
+
+                        <!-- Controls -->
+                        <div class="viz-controls">
+                            <div class="syntax-group">
+                                <span id="full-syntax" class="syntax-text"></span>
+                                <div class="toggles">
+                                    <label class="toggle-label" style="cursor: pointer;">
+                                        <input type="checkbox" id="check-aq" class="hidden-check">
+                                        <div id="toggle-aq" class="toggle-switch">
+                                            <div class="toggle-knob"></div>
+                                        </div>
+                                        <span>.aq</span>
+                                    </label>
+                                    <label class="toggle-label" style="cursor: pointer;">
+                                        <input type="checkbox" id="check-rl" class="hidden-check">
+                                        <div id="toggle-rl" class="toggle-switch">
+                                            <div class="toggle-knob"></div>
+                                        </div>
+                                        <span>.rl</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="control-actions">
+                                <button id="btn-reservation" class="btn-res hidden">
+                                    <span class="icon">●</span> Reservation
+                                </button>
+                                <button id="btn-play" class="btn-primary">Play</button>
+                                <button id="btn-next" class="btn-secondary">Next &rarr;</button>
+                                <button id="btn-reset" class="btn-secondary">Reset</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Pipeline Diagram -->
+                    <div class="pipeline-container">
+                        <svg viewBox="0 0 1000 550" id="pipeline-svg">
+                            <defs>
+                                <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"
+                                    markerUnits="strokeWidth">
+                                    <path d="M0,0 L0,6 L6,3 z" fill="#6b7280" />
+                                </marker>
+                            </defs>
+
+                            <!-- LABELS -->
+                            <text x="50" y="30" class="stage-label">IF</text>
+                            <text x="250" y="30" class="stage-label">ID / Fetch</text>
+                            <text x="450" y="30" class="stage-label">EX (Atomic ALU)</text>
+                            <text x="680" y="30" class="stage-label">MEM (Store)</text>
+                            <text x="920" y="30" class="stage-label">WB</text>
+
+                            <!-- SEPARATORS -->
+                            <line x1="180" y1="50" x2="180" y2="500" class="separator" />
+                            <line x1="380" y1="50" x2="380" y2="500" class="separator" />
+                            <line x1="580" y1="50" x2="580" y2="500" class="separator" />
+                            <line x1="880" y1="50" x2="880" y2="500" class="separator" />
+
+                            <!-- IF STAGE -->
+                            <rect id="rect-pc" x="20" y="250" width="40" height="60" rx="4" class="comp" />
+                            <text id="text-pc" x="40" y="285" textAnchor="middle" class="comp-text">PC</text>
+                            <rect id="rect-imem" x="90" y="210" width="60" height="140" rx="4" class="comp" />
+                            <text id="text-imem" x="120" y="280" textAnchor="middle" class="comp-text">IMEM</text>
+                            <!-- IF Wires -->
+                            <path id="wire-if-1" d="M60 280 L90 280" class="wire" marker-end="url(#arrow)" />
+                            <path id="wire-if-2" d="M150 280 L180 280" class="wire" marker-end="url(#arrow)" />
+
+                            <!-- ID STAGE -->
+                            <rect id="rect-control" x="220" y="60" width="120" height="80" rx="4" class="comp" />
+                            <text id="text-control" x="280" y="105" textAnchor="middle" class="comp-text">Control</text>
+
+                            <rect id="rect-regfile" x="220" y="210" width="100" height="140" rx="4" class="comp" />
+                            <text id="text-regfile" x="270" y="270" textAnchor="middle" class="comp-text">RegFile</text>
+
+                            <!-- ID Wires -->
+                            <path id="wire-id-1" d="M180 280 L200 280 L200 100 L220 100" class="wire" fill="none"
+                                marker-end="url(#arrow)" />
+                            <path id="wire-id-2" d="M180 280 L220 280" class="wire" fill="none"
+                                marker-end="url(#arrow)" />
+
+                            <!-- Special Path: ID Fetch Logic -->
+                            <!-- rs1 -->
+                            <path id="wire-rs1" d="M320 230 L620 230" class="wire" marker-end="url(#arrow)" />
+                            <text id="label-rs1" x="480" y="225" class="wire-label">rs1 (Fetch Addr)</text>
+
+                            <!-- Fetched Data Loop -->
+                            <path id="wire-fetched" d="M760 250 L800 250 L800 180 L400 180 L400 310 L440 310"
+                                class="wire" fill="none" stroke-dasharray="3,2" marker-end="url(#arrow)" />
+                            <text id="label-fetched" x="500" y="175" class="wire-label">&lt;&lt; Fetched data at rs1
+                                address &lt;&lt;</text>
+
+                            <!-- EX STAGE -->
+                            <!-- Main ALU (Ghost) -->
+                            <path d="M440 210 L500 240 L500 280 L440 310 L440 270 L450 260 L440 250 Z" fill="#f9fafb"
+                                stroke="#e5e7eb" stroke-width="1" opacity="0.5" />
+                            <text x="460" y="265" class="small-text-ghost">Main ALU</text>
+
+                            <!-- Atomic ALU -->
+                            <circle id="circle-atomic" cx="500" cy="380" r="45" class="comp" />
+                            <text id="text-atomic-1" x="500" y="375" textAnchor="middle" class="comp-text">Atomic</text>
+                            <text id="text-atomic-2" x="500" y="390" textAnchor="middle" class="comp-text">ALU</text>
+
+                            <!-- Inputs to Atomic ALU -->
+                            <!-- rs2 -->
+                            <path id="wire-rs2" d="M320 330 L340 330 L340 380 L455 380" class="wire" fill="none"
+                                marker-end="url(#arrow)" />
+                            <text id="label-rs2" x="360" y="375" class="wire-label">rs2</text>
+
+                            <!-- Old Val -->
+                            <path id="wire-oldval" d="M440 310 L460 310 L460 350" class="wire" fill="none"
+                                marker-end="url(#arrow)" />
+                            <text id="label-oldval" x="400" y="300" class="wire-label">Old Val</text>
+
+                            <!-- Output: New Value -->
+                            <path id="wire-newval" d="M545 380 L620 380" class="wire" marker-end="url(#arrow)" />
+
+                            <!-- MEM STAGE -->
+                            <rect id="rect-dmem" x="620" y="190" width="140" height="220" rx="4" class="comp" />
+                            <text id="text-dmem" x="690" y="210" textAnchor="middle" class="comp-text">DMEM</text>
+
+                            <!-- Reservation -->
+                            <rect id="rect-reservation" x="650" y="120" width="80" height="40" rx="2"
+                                stroke-dasharray="2,2" fill="#dcfce7" stroke="#16a34a" stroke-width="2" />
+                            <text id="text-reservation" x="690" y="145" textAnchor="middle" class="small-text-bold"
+                                fill="#374151">Reservation</text>
+
+                            <!-- Store Path -->
+                            <path id="wire-store" d="M620 380 L650 380" class="wire" marker-end="url(#arrow)" />
+                            <text id="label-store" x="630" y="370" class="wire-label">Write</text>
+
+                            <!-- WB STAGE -->
+                            <!-- Mux -->
+                            <path id="poly-mux" d="M880 300 L900 300 L900 340 L880 340 Z" class="comp" />
+
+                            <!-- Feed Old Value to Mux -->
+                            <path id="wire-wb-in" d="M800 180 L860 180 L860 320 L880 320" class="wire" fill="none"
+                                marker-end="url(#arrow)" />
+                            <text id="label-wb-in" x="830" y="310" class="wire-label">Old Val</text>
+
+                            <!-- WB to Reg -->
+                            <path id="wire-wb-out" d="M900 320 L950 320 L950 480 L270 480 L270 350" class="wire"
+                                fill="none" stroke-dasharray="4,4" marker-end="url(#arrow)" />
+                            <text id="label-wb-out" x="600" y="470" class="wire-label">Write Old Value to rd</text>
+                        </svg>
+                    </div>
+
+                    <!-- Info Panel -->
+                    <div id="info-panel" class="info-panel">
+                        <div class="info-header">
+                            <span class="info-icon">ℹ️</span>
+                            <h2 id="info-title">Title</h2>
+                        </div>
+                        <div class="info-body">
+                            <h3 id="info-desc">Desc</h3>
+                            <p id="info-detail">Detail</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <footer class="app-footer">
+            <span id="status-message">System Ready.</span>
+        </footer>
+    </div>
+    <script type="module" src="./main.js"></script>
+</body>
+
+</html>
