@@ -26,7 +26,7 @@ RVSimX is a modern, web-based RISC-V simulator designed for education and visual
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/kinzafatim/RVSimX.git
 cd RVSimX
 ```
 
