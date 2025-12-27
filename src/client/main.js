@@ -1,52 +1,30 @@
-import { EditorState } from "@codemirror/state"
-import { EditorView, keymap, lineNumbers, highlightActiveLineGutter } from "@codemirror/view"
-import { defaultKeymap } from "@codemirror/commands"
-import { cpp } from "@codemirror/lang-cpp"
-import { DatapathVisualizer } from "./datapath.js"
-import { initSimulator, assemble, step, run, reset, stepBack, getMemoryDump } from "./sim_bridge.js"
 
-// Initialize Application
+import { DatapathVisualizer } from "./datapath.js"
+import { initSimulator, assemble, step, run, reset, stepBack } from "./sim_bridge.js"
+import { initEditor, getCode, setEditorErrors } from "./ui/editor.js"
+import { updateState, renderRegisters, renderTrace, renderProgramList, setDatapath, setFormat } from "./ui/renderer.js"
+
+// State
+let datapath;
+let currentProgram = [];
+let currentSimState = null;
+let historyStack = [];
+
+// Initialize
 document.addEventListener('DOMContentLoaded', () => {
-    initEditor();
+    initEditor('code-panel');
     initUI();
-    fetchRegisters();
     datapath = new DatapathVisualizer('datapath-canvas');
+    setDatapath(datapath);
+
+    // Initial Render
+    renderRegisters(Array(32).fill(0));
+
     initSimulator().then(() => {
         const msg = document.getElementById('status-message');
         if (msg) msg.textContent = "System Ready";
     });
 });
-
-let editor;
-let datapath;
-let currentProgram = [];
-let currentFormat = 'hex';
-let currentSimState = null;
-let historyStack = []; // Store past states for Prev
-
-function initEditor() {
-    const textArea = document.getElementById('asm-editor');
-    const initialDoc = textArea ? textArea.value : "# RISC-V Program\nli x1, 10\nli x2, 20\nadd x3, x1, x2";
-
-    const startState = EditorState.create({
-        doc: initialDoc,
-        extensions: [
-            keymap.of(defaultKeymap),
-            lineNumbers(),
-            highlightActiveLineGutter(),
-            cpp(),
-            EditorView.theme({
-                "&": { height: "100%", fontSize: "13px" },
-                ".cm-scroller": { overflow: "auto" }
-            })
-        ]
-    });
-
-    editor = new EditorView({
-        state: startState,
-        parent: document.getElementById('code-panel')
-    });
-}
 
 function initUI() {
     // 1. View Toggles (Workbench vs Datapath)
@@ -82,18 +60,15 @@ function initUI() {
 
             // Toggle Panels
             if (targetId === 'code-panel' || targetId === 'trace-panel') {
-                // In Editor Card
                 document.getElementById('code-panel').classList.add('hidden');
                 document.getElementById('trace-panel').classList.add('hidden');
                 document.getElementById(targetId).classList.remove('hidden');
 
-                // Toggle Actions
                 const traceActs = document.getElementById('trace-actions');
                 if (targetId === 'trace-panel') traceActs.classList.remove('hidden');
                 else traceActs.classList.add('hidden');
             }
             else if (targetId === 'regs-panel' || targetId === 'mem-panel') {
-                // In Sidebar Card
                 document.getElementById('regs-panel').classList.add('hidden');
                 document.getElementById('mem-panel').classList.add('hidden');
                 document.getElementById(targetId).classList.remove('hidden');
@@ -108,15 +83,15 @@ function initUI() {
             const parent = btn.parentElement;
             parent.querySelectorAll('button').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            currentFormat = btn.dataset.value;
-            if (currentSimState) renderRegisters(currentSimState.registers);
+            let format = btn.dataset.value;
+            setFormat(format);
+            if (currentSimState) updateState(currentSimState, currentProgram);
         });
     });
 
-    // 4. Control Buttons (Assemble is always enabled)
+    // 4. Control Buttons
     document.getElementById('assemble-btn').addEventListener('click', assembleCode);
 
-    // Wire up Sim Controls - Disabled Initially
     const ctrls = [
         { id: 'run-btn', fn: runSimulation },
         { id: 'step-btn', fn: stepSimulation },
@@ -128,27 +103,25 @@ function initUI() {
         const btn = document.getElementById(item.id);
         if (btn) {
             btn.addEventListener('click', item.fn);
-            btn.disabled = true; // Disabled initially
+            btn.disabled = true;
         }
     });
 
-    // Hex Buttons
     const cpyBtn = document.getElementById('copy-hex-btn');
     if (cpyBtn) cpyBtn.addEventListener('click', copyHex);
 
     const dlBtn = document.getElementById('download-mem-btn');
     if (dlBtn) dlBtn.addEventListener('click', downloadHex);
-
-    // Initial Render
-    renderRegisters(Array(32).fill(0));
 }
 
-// --- Logic ---
-
+// Logic
 async function assembleCode() {
-    const code = editor.state.doc.toString();
+    const code = getCode();
     const status = document.getElementById('status-message');
     status.textContent = "Assembling...";
+
+    // Clear previous errors
+    setEditorErrors([]);
 
     try {
         const data = await assemble(code);
@@ -167,14 +140,17 @@ async function assembleCode() {
             // Reset state
             historyStack = [];
             currentSimState = null;
-            await reset(); // Backend reset
+            await reset();
 
             // Update UI
             renderProgramList(data.program, 0);
             renderTrace(data.program);
         } else {
-            status.textContent = `Error: ${data.message}`;
+            status.textContent = `Error: ${data.message || 'Assembly Failed'}`;
             status.style.color = "#d32f2f";
+            if (data.errors) {
+                setEditorErrors(data.errors);
+            }
         }
     } catch (e) {
         console.error('Assembly error:', e);
@@ -184,14 +160,13 @@ async function assembleCode() {
 
 async function stepSimulation() {
     try {
-        // Push current state to history before stepping
         if (currentSimState) {
             historyStack.push(JSON.parse(JSON.stringify(currentSimState)));
         }
 
         const data = await step();
         if (data.success) {
-            updateState(data.state);
+            handleStateUpdate(data.state);
             document.getElementById('status-message').textContent = "Stepped 1 instruction.";
         } else {
             document.getElementById('status-message').textContent = "End of program or Error.";
@@ -201,12 +176,11 @@ async function stepSimulation() {
 
 async function runSimulation() {
     try {
-        // Save state before run
         if (currentSimState) historyStack.push(JSON.parse(JSON.stringify(currentSimState)));
 
         const data = await run();
         if (data.success) {
-            updateState(data.state);
+            handleStateUpdate(data.state);
             document.getElementById('status-message').textContent = "Execution complete.";
         }
     } catch (e) { console.error(e); }
@@ -216,7 +190,7 @@ async function prevStep() {
     try {
         const ret = await stepBack();
         if (ret.success) {
-            updateState(ret.state);
+            handleStateUpdate(ret.state);
             document.getElementById('status-message').textContent = "Stepped Back.";
         } else {
             document.getElementById('status-message').textContent = "Cannot step back further.";
@@ -224,21 +198,65 @@ async function prevStep() {
     } catch (e) { console.error(e); }
 }
 
-async function downloadHex() {
+async function resetSimulation() {
     try {
-        if (!currentProgram || currentProgram.length === 0) {
+        historyStack = [];
+        const data = await reset();
+        if (data.success) {
+            handleStateUpdate(data.state);
+            document.getElementById('status-message').textContent = "System Reset.";
+        }
+    } catch (e) { console.error(e); }
+}
+
+function handleStateUpdate(state) {
+    if (!state) return;
+    currentSimState = state;
+    updateState(state, currentProgram);
+}
+
+function copyHex() {
+    if (!currentProgram) return;
+
+    // Sort by address for consistent hex dump
+    const addrs = Object.keys(currentProgram).map(Number).sort((a, b) => a - b);
+    let hex = "";
+
+    // Check if currentProgram is array or dict
+    if (Array.isArray(currentProgram)) {
+        hex = currentProgram.map(inst => inst.machine_code.toString(16).padStart(8, '0')).join('\n');
+    } else {
+        hex = addrs.map(addr => {
+            const inst = currentProgram[addr];
+            return inst.machine_code.toString(16).padStart(8, '0');
+        }).join('\n');
+    }
+
+    navigator.clipboard.writeText(hex);
+    alert('Copied.');
+}
+
+function downloadHex() {
+    try {
+        if (!currentProgram || (Array.isArray(currentProgram) && currentProgram.length === 0) || (typeof currentProgram === 'object' && Object.keys(currentProgram).length === 0)) {
             console.warn("No program assembled.");
             return;
         }
 
-        // Generate hex dump of instructions
-        // Each instruction's machine_code is a 32-bit integer.
-        // We format it as 8-digit hex string.
         let hexOutput = "";
-        for (const inst of currentProgram) {
-            // Need unsigned 32-bit hex
-            const hex = (inst.machine_code >>> 0).toString(16).padStart(8, '0');
-            hexOutput += hex + "\n";
+
+        if (Array.isArray(currentProgram)) {
+            for (const inst of currentProgram) {
+                const hex = (inst.machine_code >>> 0).toString(16).padStart(8, '0');
+                hexOutput += hex + "\n";
+            }
+        } else {
+            const addrs = Object.keys(currentProgram).map(Number).sort((a, b) => a - b);
+            for (const addr of addrs) {
+                const inst = currentProgram[addr];
+                const hex = (inst.machine_code >>> 0).toString(16).padStart(8, '0');
+                hexOutput += hex + "\n";
+            }
         }
 
         const blob = new Blob([hexOutput], { type: 'text/plain' });
@@ -249,211 +267,4 @@ async function downloadHex() {
         a.click();
         URL.revokeObjectURL(url);
     } catch (e) { console.error(e); }
-}
-
-async function resetSimulation() {
-    try {
-        historyStack = [];
-        const data = await reset();
-        if (data.success) {
-            updateState(data.state);
-            document.getElementById('status-message').textContent = "System Reset.";
-        }
-    } catch (e) { console.error(e); }
-}
-
-async function fetchRegisters() { }
-
-const regNames = [
-    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
-    "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
-    "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
-    "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"
-];
-
-function updateState(state) {
-    if (!state) return;
-    currentSimState = state;
-
-    // PC Badge
-    const pcHex = "0x" + state.pc.toString(16).padStart(4, '0').toUpperCase();
-    document.querySelectorAll('.pc-badge span').forEach(el => el.textContent = pcHex);
-
-    renderRegisters(state.registers);
-    renderMemory(state.memory);
-    highlightTrace(state.pc);
-    renderProgramList(currentProgram, state.pc);
-
-    if (datapath) {
-        datapath.draw(state);
-    }
-}
-
-function renderRegisters(values) {
-    const container = document.getElementById('regs-panel');
-    container.innerHTML = '';
-
-    values.forEach((val, idx) => {
-        const row = document.createElement('div');
-        row.className = 'register-row';
-
-        // Name
-        const nameCol = document.createElement('div');
-        nameCol.className = 'reg-name';
-
-        const idSpan = document.createElement('span');
-        idSpan.className = 'reg-id';
-        idSpan.textContent = `x${idx}`;
-
-        const aliasSpan = document.createElement('span');
-        aliasSpan.className = 'reg-alias';
-        aliasSpan.textContent = `(${regNames[idx]})`;
-
-        nameCol.appendChild(idSpan);
-        nameCol.appendChild(aliasSpan);
-
-        // Value
-        const valueSpan = document.createElement('span');
-        valueSpan.className = 'reg-val';
-
-        if (currentFormat === 'hex') {
-            valueSpan.textContent = "0x" + val.toString(16).padStart(8, '0');
-        } else {
-            valueSpan.textContent = (val | 0).toString();
-        }
-
-        row.appendChild(nameCol);
-        row.appendChild(valueSpan);
-        container.appendChild(row);
-    });
-}
-
-function renderMemory(memory) {
-    const container = document.getElementById('memory-hex');
-    if (!container) return;
-    container.innerHTML = '';
-
-    // Header
-    const headerRow = document.createElement('div');
-    headerRow.className = 'memory-header-row';
-    const addrCol = document.createElement('div');
-    addrCol.className = 'mem-addr-col';
-    addrCol.textContent = 'Addrs';
-    headerRow.appendChild(addrCol);
-
-    const bytesCol = document.createElement('div');
-    bytesCol.className = 'mem-data-col';
-    for (let i = 0; i < 8; i++) {
-        const b = document.createElement('span');
-        b.className = 'mem-byte';
-        b.textContent = `+${i}`;
-        bytesCol.appendChild(b);
-    }
-    headerRow.appendChild(bytesCol);
-    container.appendChild(headerRow);
-
-    // Separator
-    const sep = document.createElement('div');
-    sep.className = 'memory-separator';
-    container.appendChild(sep);
-
-    if (!memory) memory = {};
-
-    // Determine range: Always show at least 0x0000 to 0x00F8 (256 bytes)
-    // If memory has higher addresses, include them too.
-    let maxAddr = 255;
-    const keys = Object.keys(memory).map(Number);
-    if (keys.length > 0) {
-        maxAddr = Math.max(maxAddr, ...keys);
-    }
-
-    // Round up maxAddr to next multiple of 8 minus 1
-    // e.g. if 255 -> 255.
-    // if 256 -> 263 (new row).
-    maxAddr = Math.ceil((maxAddr + 1) / 8) * 8 - 1;
-
-    // Generate Rows
-    for (let baseAddr = 0; baseAddr <= maxAddr; baseAddr += 8) {
-        const row = document.createElement('div');
-        row.className = 'memory-row';
-
-        const addr = document.createElement('span');
-        addr.className = 'mem-addr-col';
-        addr.textContent = baseAddr.toString(16).padStart(4, '0').toUpperCase() + ":";
-        row.appendChild(addr);
-
-        const dataGrid = document.createElement('div');
-        dataGrid.className = 'mem-data-col';
-
-        for (let offset = 0; offset < 8; offset++) {
-            const currentAddr = baseAddr + offset;
-            const val = memory[currentAddr] !== undefined ? memory[currentAddr] : 0;
-            const b = document.createElement('span');
-            b.className = 'mem-byte';
-            b.textContent = (val & 0xFF).toString(16).padStart(2, '0').toUpperCase();
-            dataGrid.appendChild(b);
-        }
-        row.appendChild(dataGrid);
-        container.appendChild(row);
-    }
-}
-
-function renderTrace(program) {
-    const tbody = document.getElementById('trace-body');
-    tbody.innerHTML = '';
-    if (!program) return;
-
-    program.forEach(inst => {
-        const row = document.createElement('tr');
-        row.id = `trace-${inst.address}`;
-
-        const mach = document.createElement('td');
-        mach.style.fontFamily = 'monospace';
-        mach.textContent = "0x" + inst.machine_code.toString(16).padStart(8, '0').toUpperCase();
-
-        const basic = document.createElement('td');
-        basic.textContent = inst.basic_code || inst.source;
-
-        const orig = document.createElement('td');
-        orig.textContent = inst.source;
-
-        row.appendChild(mach);
-        row.appendChild(basic);
-        row.appendChild(orig);
-        tbody.appendChild(row);
-    });
-}
-
-function highlightTrace(pc) {
-    document.querySelectorAll('.trace-table tr').forEach(r => r.classList.remove('current-inst'));
-    const row = document.getElementById(`trace-${pc}`);
-    if (row) {
-        row.classList.add('current-inst');
-        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-}
-
-function renderProgramList(program, currentPc) {
-    const container = document.getElementById('program-list');
-    if (!container) return;
-    container.innerHTML = '';
-    if (!program) return;
-
-    program.forEach(inst => {
-        const row = document.createElement('div');
-        row.className = 'program-row';
-        if (inst.address === currentPc) row.classList.add('active');
-
-        const txt = document.createElement('span');
-        txt.textContent = inst.source;
-        row.appendChild(txt);
-        container.appendChild(row);
-    });
-}
-
-function copyHex() {
-    if (!currentProgram) return;
-    const hex = currentProgram.map(inst => inst.machine_code.toString(16).padStart(8, '0')).join('\n');
-    navigator.clipboard.writeText(hex);
-    alert('Copied.');
 }

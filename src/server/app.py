@@ -1,3 +1,4 @@
+
 from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
 import sys
@@ -24,8 +25,19 @@ def assemble():
     data = request.json
     code = data.get('code', '')
     try:
-        success, message = simulator.assemble(code)
-        return jsonify({'success': success, 'message': message, 'program': simulator.program})
+        result = simulator.assemble(code)
+        # simulator.assemble returns (success, message_or_errors)
+        success = result[0]
+        payload = result[1]
+        
+        if success:
+             return jsonify({'success': True, 'message': payload, 'program': simulator.program})
+        else:
+             # payload is list of errors or string message
+             if isinstance(payload, list):
+                 return jsonify({'success': False, 'message': 'Assembly Failed', 'errors': payload})
+             else:
+                 return jsonify({'success': False, 'message': payload})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
 

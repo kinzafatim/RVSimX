@@ -1,71 +1,27 @@
+
 import re
 import struct
-
-class Memory:
-    def __init__(self):
-        self.data = {} # Sparse integer map address -> byte
-    
-    def read(self, addr, size, signed=False):
-        val = 0
-        for i in range(size):
-            val |= self.data.get(addr + i, 0) << (i * 8)
-        
-        if signed:
-            # Sign extend
-            bits = size * 8
-            if val & (1 << (bits - 1)):
-                val -= 1 << bits
-        return val
-
-    def write(self, addr, val, size):
-        for i in range(size):
-            self.data[addr + i] = (val >> (i * 8)) & 0xFF
-
-class CSRFile:
-    def __init__(self):
-        self.csrs = {
-            0x300: 0, # mstatus
-            0x305: 0, # mtvec
-            0x341: 0, # mepc
-            0x342: 0, # mcause
-        }
-    
-    def read(self, csr_addr):
-        return self.csrs.get(csr_addr, 0)
-    
-    def write(self, csr_addr, val):
-        self.csrs[csr_addr] = val
+from .memory import Memory
+from .csr import CSRFile
+from .instructions import get_executors
 
 class RISCVSimulator:
     def __init__(self):
         self.reset()
-        # Dispatch table for execution
-        self.executors = {
-            'add': self.exec_r_type, 'sub': self.exec_r_type, 'sll': self.exec_r_type,
-            'slt': self.exec_r_type, 'sltu': self.exec_r_type, 'xor': self.exec_r_type,
-            'srl': self.exec_r_type, 'sra': self.exec_r_type, 'or': self.exec_r_type,
-            'and': self.exec_r_type,
-            'addi': self.exec_i_type, 'slti': self.exec_i_type, 'sltiu': self.exec_i_type,
-            'xori': self.exec_i_type, 'ori': self.exec_i_type, 'andi': self.exec_i_type,
-            'slli': self.exec_i_type, 'srli': self.exec_i_type, 'srai': self.exec_i_type,
-            'lb': self.exec_load, 'lh': self.exec_load, 'lw': self.exec_load,
-            'lbu': self.exec_load, 'lhu': self.exec_load,
-            'sb': self.exec_store, 'sh': self.exec_store, 'sw': self.exec_store,
-            'beq': self.exec_branch, 'bne': self.exec_branch, 'blt': self.exec_branch,
-            'bge': self.exec_branch, 'bltu': self.exec_branch, 'bgeu': self.exec_branch,
-            'jal': self.exec_jal, 'jalr': self.exec_jalr,
-            'lui': self.exec_lui, 'auipc': self.exec_auipc,
-            'ecall': self.exec_ecall
-        }
+        # Dispatch table
+        self.executors = get_executors()
 
     def reset(self):
         self.x = [0] * 32
+        self.f = [0] * 32 # Float registers (integers representing bits)
         self.pc = 0
         self.memory = Memory()
         self.csrs = CSRFile()
-        self.program = []
+        self.program = {} # Address -> Inst
         self.labels = {}
         self.pipeline_state = self.empty_pipeline_state()
+        self.reservation = None
+        self.current_inst = None
 
     def empty_pipeline_state(self):
         return {
@@ -74,300 +30,181 @@ class RISCVSimulator:
             'alu_out': 0, 'mem_out': 0,
             'reg_write': False, 'mem_write': False, 'mem_read': False,
             'branch_taken': False,
-            # Control signals for datapath
             'alu_src_a': 'reg', 'alu_src_b': 'reg', 'mem_to_reg': 'alu',
             'branch': False, 'jump': False
         }
 
     def assemble(self, code):
-        self.program = []
+        self.program = {}
         self.labels = {}
         lines = code.split('\n')
+        errors = []
         
-        # Pass 1: Labels
+        # Pass 1: Labels and Lines
         current = 0
-        clean = []
-        for line in lines:
+        clean = [] # (addr, line_content, original_line_index_1_based)
+        
+        # We need to map labels first.
+        # But to map labels we need to know addresses.
+        # To know addresses we need to know instruction lengths.
+        # So we iterate valid lines.
+        
+        for i, line in enumerate(lines):
+            raw = line
             line = line.split('#')[0].strip()
             if not line: continue
+            
             if line.endswith(':'):
                 self.labels[line[:-1]] = current
             else:
-                clean.append(line)
-                current += 4
+                # Guess length
+                parts = line.replace(',', ' ').split()
+                try: 
+                    op = parts[0].lower()
+                    length = 2 if op.startswith('c.') else 4
+                except:
+                    length = 4 # Default to 4 if parse fail, will fail in Pass 2
+                
+                clean.append((current, line, i + 1))
+                current += length
         
         # Pass 2: Parse
-        current = 0
-        for line in clean:
+        for addr, line, line_num in clean:
             try:
-                inst = self.parse_line(line, current)
-                self.program.append(inst)
-                current += 4
+                inst = self.parse_line(line, addr)
+                self.program[addr] = inst
             except Exception as e:
-                return False, f"Error assembling '{line}': {e}"
-        return True, "Assembled"
+                errors.append({'line': line_num, 'message': str(e)})
+                
+        if errors:
+            return False, errors
+            
+        return True, "Assembled successfully"
 
     def parse_line(self, line, addr):
-        # Simplified parser that handles the instructions we support
-        # This duplicates some logic but cleaner for the "new simulator" rewrite
         parts = line.replace(',', ' ').split()
+        if not parts: raise Exception("Empty line")
         op = parts[0].lower()
         args = parts[1:]
+
+        # Stripping atomic suffixes for standard atomic ops if needed, 
+        # but our executors map 'lr.w', 'sc.w' etc directly.
+        # However, for 'amoadd.w.aq' we might need stripping.
+        # The executors in rv32a.py key on 'amoadd.w' etc.
+        # So we should strip .aq, .rl, .aqrl.
         
+        original_op = op
+        for suffix in ['.aqrl', '.aq', '.rl']:
+            if op.endswith(suffix) and op not in ['lr.w', 'sc.w']: # lr.w is exact match usually, but lr.w.aq is possible? Yes.
+                 # Actually standard is lr.w.aq. 
+                 # My executors use 'lr.w'.
+                 # So I should strip from ANY atomic op.
+                 op = op[:-len(suffix)]
+                 break
+        
+        # Re-check if valid op
+        if op not in self.executors and original_op not in self.executors:
+             # Try stripping from atomic again if missed?
+             pass
+
         inst = {
             'address': addr,
             'source': line,
-            'basic_code': line, # placeholder
             'op': op,
             'args': [],
-            'machine_code': 0 # We won't implement full binary encoding here to save space unless asked, visualization uses op/args mostly
+            'machine_code': 0, # Placeholder
+            'length': 2 if op.startswith('c.') else 4
         }
         
-        # Helper Parse
         def get_reg(s):
             if s in ['zero', 'x0']: return 0
             if s.startswith('x'): return int(s[1:])
-            # ABI
             abis = ['zero','ra','sp','gp','tp','t0','t1','t2','s0','s1','a0','a1','a2',
                     'a3','a4','a5','a6','a7','s2','s3','s4','s5','s6','s7','s8','s9',
                     's10','s11','t3','t4','t5','t6']
             if s in abis: return abis.index(s)
+            
+            if s.startswith('f'):
+                try: return int(s[1:])
+                except: pass
+            
+            f_abis = ['ft0','ft1','ft2','ft3','ft4','ft5','ft6','ft7','fs0','fs1','fa0','fa1',
+                      'fa2','fa3','fa4','fa5','fa6','fa7','fs2','fs3','fs4','fs5','fs6','fs7',
+                      'fs8','fs9','fs10','fs11','ft8','ft9','ft10','ft11']
+            if s in f_abis: return f_abis.index(s)
+            
             if s == 'fp': return 8
-            try: return int(s)
-            except: return 0
+            raise Exception(f"Invalid register: {s}")
 
         def get_imm(s):
             if s in self.labels: return self.labels[s] - addr
             try: return int(s, 0)
-            except: return 0
+            except: raise Exception(f"Invalid immediate: {s}")
 
-        # Argument Parsing based on types
-        if op in ['add','sub','sll','slt','sltu','xor','srl','sra','or','and']:
-            inst['type'] = 'R'
-            inst['args'] = [get_reg(args[0]), get_reg(args[1]), get_reg(args[2])]     
-        elif op in ['addi','slti','sltiu','xori','ori','andi','slli','srli','srai','jalr']:
-            inst['type'] = 'I'
-            inst['args'] = [get_reg(args[0]), get_reg(args[1]), get_imm(args[2])]
-        elif op in ['lb','lh','lw','lbu','lhu']:
-            inst['type'] = 'I'
-            # offset(base) -> offset, base
-            if '(' in args[1]:
-                off, base = args[1].replace(')', '').split('(')
-                inst['args'] = [get_reg(args[0]), get_imm(off), get_reg(base)]
+        parsed_args = []
+        for a in args:
+            if '(' in a:
+                # offset(base)
+                off_str, base_str = a.replace(')', '').split('(')
+                parsed_args.append(get_imm(off_str))
+                parsed_args.append(get_reg(base_str))
             else:
-                 inst['args'] = [get_reg(args[0]), get_imm(args[1]), 0]
-        elif op in ['sb','sh','sw']:
-            inst['type'] = 'S'
-            if '(' in args[1]:
-                off, base = args[1].replace(')', '').split('(')
-                inst['args'] = [get_reg(args[0]), get_imm(off), get_reg(base)]
-            else:
-                inst['args'] = [get_reg(args[0]), get_imm(args[1]), 0]
-        elif op in ['beq','bne','blt','bge','bltu','bgeu']:
-            inst['type'] = 'B'
-            inst['args'] = [get_reg(args[0]), get_reg(args[1]), get_imm(args[2])]
-        elif op in ['lui','auipc']:
-            inst['type'] = 'U'
-            inst['args'] = [get_reg(args[0]), get_imm(args[1])]
-        elif op == 'jal':
-            inst['type'] = 'J'
-            if len(args) == 1: # j label -> jal x0, label? No j is pseudo. jal label -> jal ra, label
-                inst['args'] = [1, get_imm(args[0])] # default ra (1)
-            else:
-                inst['args'] = [get_reg(args[0]), get_imm(args[1])]
-        elif op == 'li': # Pseudo
-            inst['op'] = 'addi' # Treat as addi type for sim
-            inst['type'] = 'I'
-            inst['args'] = [get_reg(args[0]), 0, get_imm(args[1])]
-            inst['basic_code'] = f"addi x{inst['args'][0]}, x0, {inst['args'][2]}"
-        elif op == 'mv':
-            inst['op'] = 'addi'
-            inst['type'] = 'I'
-            inst['args'] = [get_reg(args[0]), get_reg(args[1]), 0]
-        elif op == 'ecall':
-            inst['type'] = 'I' 
-            inst['args'] = []
-
-        # Simple manual encoding for visualizer
-        # We really should do thorough encoding but for Step 117 request "interpreter like spike" 
-        # the execution logic is more important. The UI uses the binary for hex dump.
-        # I will leave machine_code as 0 or implement a simple encoder later if needed.
-        # The previous version had encoding. I'll omit it here for brevity to focus on Executor engine structure.
-        inst['machine_code'] = 0x00000013 # NOP default
+                if a in self.labels: parsed_args.append(get_imm(a))
+                elif (a[0].isdigit() or a[0] == '-' or a.startswith('0x')): parsed_args.append(get_imm(a))
+                else: parsed_args.append(get_reg(a))
+        
+        inst['args'] = parsed_args
+        
+        # Fix JAL args
+        # jal label -> [imm] -> [1, imm]
+        if op == 'jal' and len(parsed_args) == 1:
+            inst['args'] = [1, parsed_args[0]]
+            
         return inst
 
     def step(self):
-        if self.pc // 4 >= len(self.program): return
+        inst = self.program.get(self.pc)
+        if not inst: return
 
-        inst = self.program[self.pc // 4]
+        self.current_inst = inst
         self.pipeline_state = self.empty_pipeline_state()
         self.pipeline_state['pc'] = self.pc
         self.pipeline_state['inst'] = inst['machine_code']
         
         handler = self.executors.get(inst['op'], self.exec_unknown)
+        handler(self, inst) 
         
-        # Log before exec
-        # print(f"Exec: {inst['op']} {inst['args']}")
-        
-        handler(inst)
-        
-        self.x[0] = 0 # Hardwire zero
+        self.x[0] = 0 
 
     def run(self):
         counter = 0
-        while self.pc // 4 < len(self.program) and counter < 5000:
+        while self.program.get(self.pc) and counter < 5000:
             self.step()
             counter += 1
 
     def get_state(self):
+        flat_mem = {}
+        for base, page in self.memory.pages.items():
+            for i, b in enumerate(page):
+                if b != 0: flat_mem[base + i] = b
+
         return {
             'registers': self.x,
+            'f_registers': self.f,
             'pc': self.pc,
-            'memory': self.memory.data,
+            'memory': flat_mem,
             'pipeline': self.pipeline_state
         }
-
-    # --- Executors ---
     
-    def exec_r_type(self, inst):
-        rd, rs1, rs2 = inst['args']
-        v1 = self.x[rs1]
-        v2 = self.x[rs2]
-        op = inst['op']
-        res = 0
-        
-        if op == 'add': res = v1 + v2
-        elif op == 'sub': res = v1 - v2
-        elif op == 'and': res = v1 & v2
-        elif op == 'or': res = v1 | v2
-        elif op == 'xor': res = v1 ^ v2
-        elif op == 'sll': res = v1 << (v2 & 0x1F)
-        elif op == 'srl': res = (v1 & 0xFFFFFFFF) >> (v2 & 0x1F)
-        elif op == 'sra': 
-            # mimic signed shift via struct/bit manip
-            val_s = struct.unpack('i', struct.pack('I', v1 & 0xFFFFFFFF))[0]
-            res = val_s >> (v2 & 0x1F)
-        elif op == 'slt': res = 1 if (struct.unpack('i', struct.pack('I', v1 & 0xFFFFFFFF))[0] < struct.unpack('i', struct.pack('I', v2 & 0xFFFFFFFF))[0]) else 0
-        elif op == 'sltu': res = 1 if (v1 & 0xFFFFFFFF) < (v2 & 0xFFFFFFFF) else 0
-
-        self.write_reg(rd, res)
-        self.update_pipe(rd=rd, rs1=rs1, rs2=rs2, alu_out=res, alu_src_b='reg')
-
-    def exec_i_type(self, inst):
-        rd, rs1, imm = inst['args']
-        v1 = self.x[rs1]
-        op = inst['op']
-        res = 0
-        
-        if op == 'addi': res = v1 + imm
-        elif op == 'andi': res = v1 & imm
-        elif op == 'ori': res = v1 | imm
-        elif op == 'xori': res = v1 ^ imm
-        elif op == 'slli': res = v1 << (imm & 0x1F)
-        elif op == 'srli': res = (v1 & 0xFFFFFFFF) >> (imm & 0x1F)
-        elif op == 'srai':
-            val_s = struct.unpack('i', struct.pack('I', v1 & 0xFFFFFFFF))[0]
-            res = val_s >> (imm & 0x1F)
-        elif op == 'slti': res = 1 if (struct.unpack('i', struct.pack('I', v1 & 0xFFFFFFFF))[0] < imm) else 0
-        elif op == 'sltiu': res = 1 if (v1 & 0xFFFFFFFF) < (imm & 0xFFFFFFFF) else 0
-
-        self.write_reg(rd, res)
-        self.update_pipe(rd=rd, rs1=rs1, imm=imm, alu_out=res, alu_src_b='imm')
-
-    def exec_load(self, inst):
-        rd, imm, rs1 = inst['args']
-        addr = (self.x[rs1] + imm) & 0xFFFFFFFF
-        op = inst['op']
-        
-        signed = op in ['lb', 'lh', 'lw']
-        size = 4 if 'w' in op else (2 if 'h' in op else 1)
-        
-        val = self.memory.read(addr, size, signed)
-        self.write_reg(rd, val)
-        self.update_pipe(rd=rd, rs1=rs1, imm=imm, alu_out=addr, mem_out=val, mem_read=True, mem_to_reg='mem', alu_src_b='imm')
-
-    def exec_store(self, inst):
-        rs2, imm, rs1 = inst['args']
-        addr = (self.x[rs1] + imm) & 0xFFFFFFFF
-        val = self.x[rs2]
-        size = 4 if 'w' in inst['op'] else (2 if 'h' in inst['op'] else 1)
-        
-        self.memory.write(addr, val, size)
-        self.update_pipe(rs1=rs1, rs2=rs2, imm=imm, alu_out=addr, mem_write=True, alu_src_b='imm')
-        self.pc += 4
-
-    def exec_branch(self, inst):
-        rs1, rs2, imm = inst['args']
-        v1 = self.x[rs1]
-        v2 = self.x[rs2]
-        op = inst['op']
-        take = False
-        
-        # Signed comparison helper
-        s1 = struct.unpack('i', struct.pack('I', v1 & 0xFFFFFFFF))[0]
-        s2 = struct.unpack('i', struct.pack('I', v2 & 0xFFFFFFFF))[0]
-        
-        if op == 'beq': take = (v1 == v2)
-        elif op == 'bne': take = (v1 != v2)
-        elif op == 'blt': take = (s1 < s2)
-        elif op == 'bge': take = (s1 >= s2)
-        elif op == 'bltu': take = (v1 < v2)
-        elif op == 'bgeu': take = (v1 >= v2)
-
-        self.update_pipe(rs1=rs1, rs2=rs2, imm=imm, branch=True, branch_taken=take)
-        if take:
-            self.pc += imm
-        else:
-            self.pc += 4
-
-    def exec_jal(self, inst):
-        rd, imm = inst['args']
-        next_inst = self.pc + 4
-        self.write_reg(rd, next_inst)
-        self.update_pipe(rd=rd, imm=imm, jump=True, branch_taken=True)
-        self.pc += imm
-
-    def exec_jalr(self, inst):
-        rd, rs1, imm = inst['args']
-        next_inst = self.pc + 4
-        target = (self.x[rs1] + imm) & ~1
-        self.write_reg(rd, next_inst)
-        self.update_pipe(rd=rd, rs1=rs1, imm=imm, jump=True, branch_taken=True)
-        self.pc = target
-
-    def exec_lui(self, inst):
-        rd, imm = inst['args']
-        val = (imm << 12) & 0xFFFFFFFF
-        self.write_reg(rd, val)
-        self.update_pipe(rd=rd, imm=imm, alu_out=val, alu_src_a='x', alu_src_b='imm')
-
-    def exec_auipc(self, inst):
-        rd, imm = inst['args']
-        val = (self.pc + imm) & 0xFFFFFFFF
-        self.write_reg(rd, val)
-        self.update_pipe(rd=rd, imm=imm, alu_out=val, alu_src_a='pc', alu_src_b='imm')
-        
-    def exec_ecall(self, inst):
-        # Spike-like ecall handling (minimal syscalls)
-        # a7 (x17) holds syscall number
-        syscall = self.x[17]
-        if syscall == 93: # exit
-            self.pc = len(self.program) * 4 # Trap to end
-        elif syscall == 1: # print char
-            print(chr(self.x[10] & 0xFF), end='')
-            self.pc += 4
-        else:
-            self.pc += 4
-
-    def exec_unknown(self, inst):
-        print(f"Unknown instruction: {inst['op']}")
-        self.pc += 4
-
     def write_reg(self, rd, val):
         if rd != 0:
             self.x[rd] = val & 0xFFFFFFFF
-        self.pc += 4
-
-    def update_pipe(self, **kwargs):
-        self.pipeline_state.update(kwargs)
+            # Do NOT update PC here. Executors handle it.
+            
+    def write_freg(self, rd, val):
+        self.f[rd] = val 
+        
+    def exec_unknown(self, sim, inst):
+        print(f"Unknown instruction: {inst['op']}")
+        self.pc += inst.get('length', 4)
 
